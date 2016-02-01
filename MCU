@@ -1,0 +1,206 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.all;
+use IEEE.STD_LOGIC_ARITH.all;
+use IEEE.STD_LOGIC_UNSIGNED.all;
+
+entity mcu is port (
+  clk,reset : in std_logic;
+  oe_bar: out std_logic; -- to read from the Instruction Memory
+  address: out std_logic_vector(7 downto 0); -- It indicates the current instruction address
+  instruction: in std_logic_vector(16 downto 0); -- It receives a 17-bit instruction
+  input_port: in std_logic_vector(7 downto 0); -- input port to connect to peripheral devices
+  output_port: out std_logic_vector(7 downto 0); -- output port to connect to peripheral devices
+  port_id:out std_logic_vector(7 downto 0) -- It indicates the port address for export(EXP) operation.
+);
+end mcu;
+
+
+
+architecture MC_U of mcu is
+
+  component idu  
+    port (
+      instruction: in std_logic_vector(16 downto 0); 
+      operation: out std_logic_vector(3 downto 0); 
+      shift_rotate_operation: out std_logic_vector(2 downto 0); 
+      operand_selection: out std_logic; 
+      x_address,y_address : out std_logic_vector(3 downto 0); 
+      port_address: out std_logic_vector(7 downto 0); 
+      conditional: out std_logic; 
+      jump: out std_logic; 
+      jump_address: out std_logic_vector(7 downto 0); 
+      condition_flag: out std_logic;  
+      exp: out std_logic; 
+      halt: out std_logic
+    );
+  end component;
+
+  component register_bank  
+    port (
+      clk,reset, write_enable : in std_logic;
+      data_in: in std_logic_vector(7 downto 0); 
+      address_w,address_r1, address_r2: in std_logic_vector(3 downto 0); 
+      data_out1,data_out2 : out std_logic_vector(7 downto 0) 
+    );
+  end component;
+
+  component alu is 
+    port (
+      operation: in std_logic_vector(3 downto 0); 
+      shift_rotate_operation: in std_logic_vector(2 downto 0); 
+      operand_a,operand_b : in std_logic_vector(7 downto 0); 
+      result:out std_logic_vector(7 downto 0); 
+      zero,carry : out std_logic;
+      input_port:in std_logic_vector(7 downto 0); 
+      port_address: in std_logic_vector(7 downto 0); 
+      output_port:out std_logic_vector(7 downto 0); 
+      port_ID: out std_logic_vector(7 downto 0) 
+    );
+  end component;
+
+--signals for IDU connection
+  signal op: std_logic_vector (3 downto 0);
+  signal sro: std_logic_vector(2 downto 0):="ZZZ";
+  signal op_sel: std_logic:='0';
+  signal xa,ya: std_logic_vector(3 downto 0);
+  signal prtadd: std_logic_vector (7 downto 0):=(others => '0');
+  signal cond, jmp,cond_f, ex_p, hal_t: std_logic:= '0';
+  signal jadd: std_logic_vector (7 downto 0):= (others =>'0');
+
+--signals for Register Bank connection
+  signal w_e: std_logic:='1';
+  signal ram_in: std_logic_vector (7 downto 0):= (others => 'Z');
+  signal wr_add: std_logic_vector (3 downto 0);
+  signal do1, do2 : std_logic_vector (7 downto 0):=(others => '0');
+
+--signals for Alu connection
+  signal opr1, opr2: std_logic_vector (7 downto 0):=(others => '0');
+  signal alu_res: std_logic_vector (7 downto 0):=(others => 'Z');
+  signal aluz, aluc :  std_logic:='0';
+  signal i_port,o_port,p_id: std_logic_vector(7 downto 0):="ZZZZZZZZ"; -- MCU IOs
+  
+ -- signal pc: std_logic_vector (7 downto 0):=(others =>'0');
+  ---------------------------------------------------------
+  
+  signal ram_out: std_logic_vector(7 downto 0):="ZZZZZZZZ"; 
+
+  ----------------------------------------------------------------
+
+  type mcu_state is (reset_state,ID_EX,WB,Invalid);
+  signal state: mcu_state;
+			
+begin
+  I_D : idu port map(instruction,op,sro,op_sel,xa,ya,prtadd,cond,jmp,jadd,cond_f,ex_p,hal_t); 
+  RB : register_bank port map(clk,reset,w_e,ram_in,wr_add,xa,ya,do1,do2);
+  ALU1 : alu port map(op,sro,opr1,opr2,alu_res,aluz,aluc,i_port,prtadd,o_port,p_id);
+ 
+  process(clk,reset) begin
+     if reset = '1' then 
+           state <= reset_state;
+	  -- pc <= (OTHERS => '0');
+     elsif (clk'event and clk = '1') then
+  	   case state is
+            when reset_state => state <= ID_EX;
+            when ID_EX       => state <= WB;
+            when WB          => state <= ID_EX;
+            when others      => state <= Invalid;
+         end case;
+     end if;
+  end process;
+
+  process(state) 
+    variable pic:std_logic_vector(7 downto 0):="00000000"; -- program current address
+  begin
+     if(state=ID_EX) then     --Instruction and Decode stage
+        w_e <= '0';           --disable write enable signal      
+        oe_bar <= '0';        --enable instruction read
+                  
+       if (hal_t = '1') then 
+	  pic := pic;
+          address <= pic;
+       else
+	  if(jmp='1') then       
+		
+		if ( (cond = '0') or (cond_f = '1' and aluc ='1') or (cond_f = '0' and aluz ='1')) then  --JC and JZ case		            
+		     address <= instruction (7 downto 0);
+		     pic := instruction(7 downto 0);         
+		else
+		     address <= pic; --conditional jump false case
+		end if;
+	        pic := pic +1;		      
+           else    
+               address <= pic;    
+               pic := pic + 1; --else simply increment by 1
+	   end if;
+         end if;	    
+	                         
+        
+      elsif (state=WB) then       --write back stage
+	
+        if op ="0000" then --load operation
+           w_e <= '1';  --enable write to the memory
+           wr_add <= instruction(11 downto 8);  --where to write in memory   
+	           if (op_sel = '1') then --constant is to be written when op_sel = '1'
+	                ram_out <= instruction (7 downto 0); --constant is 7 downto 0 in the instruction vector
+	           else  
+                  ram_out <= do2; --Ry data is to be written in this case        
+             end if;
+
+	-- load input port data to Rx
+         elsif(op="0101") then 
+           w_e <= '1';
+           wr_add <= instruction(11 downto 8);
+           ram_out <= "ZZZZZZZZ";
+	
+        -- Export operation, load Rx data to output port
+         elsif(op="0111") then 
+           w_e <= '0';
+           port_id <= prtadd;
+           wr_add <= "ZZZZ";
+           output_port <= do1;
+           ram_out <= "ZZZZZZZZ"; 
+
+        -- all jump operations
+         elsif(op="1111") then
+           w_e <= '0';
+           wr_add <= "ZZZZ";
+           ram_out <= "ZZZZZZZZ";
+         
+        -- all alu arithmatic operations 
+         else
+           -- get RAM data for alu operations
+           -- if op_sel = 0 means operation done with Ry (RAM(Ry)), 1 means ALU takes constant instruction(7 downto 0). 
+           -- need above data and RAM(Rx)
+           -- do1 and do2 return data of Rx and Ry addresses,    
+           w_e <= '1';
+           wr_add <= instruction(11 downto 8); 
+           ram_out <= "ZZZZZZZZ";
+           
+           if(op_sel='0') then
+                  opr1 <= do1;
+                  opr2 <= do2;
+           else
+                  opr1 <= do1;
+                  opr2 <= instruction(7 downto 0);
+           end if;
+          
+        end if;  
+       end if; 
+  end process;
+
+  process(alu_res,ram_out) begin
+     if (state=WB) then       
+
+      	 if (op = "0000") then
+           ram_in <= ram_out;         
+        elsif(op="0101") then 
+           ram_in <= input_port; 
+        elsif(op="0111") then  --does not write in this case
+        elsif(op="1111") then  --does not write in this case
+        else
+           ram_in <= alu_res;
+        end if;                 
+     end if;
+  end process;
+ 
+end MC_U;
